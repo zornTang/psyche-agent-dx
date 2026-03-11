@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -10,12 +12,17 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from psyche_agent_dx.knowledge import InMemoryKnowledgeBase
+from psyche_agent_dx.knowledge import InMemoryKnowledgeBase, default_corpus_path, load_documents
 
 
 class KnowledgeBaseSearchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.knowledge_base = InMemoryKnowledgeBase()
+
+    def test_default_corpus_file_exists_and_loads(self) -> None:
+        documents = load_documents(default_corpus_path())
+
+        self.assertGreaterEqual(len(documents), 10)
 
     def test_chinese_query_matches_gad_entry(self) -> None:
         results = self.knowledge_base.search("患者长期过度担心 紧张 睡眠障碍", limit=5)
@@ -46,6 +53,34 @@ class KnowledgeBaseSearchTests(unittest.TestCase):
         ids = [item.id for item in results]
 
         self.assertIn("dsm5-zh-illness-anxiety", ids)
+
+    def test_can_load_custom_jsonl_corpus(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            corpus_path = Path(temp_dir) / "custom.jsonl"
+            records = [
+                {
+                    "id": "custom-1",
+                    "title": "Custom Anxiety Chunk",
+                    "source": "dsm5",
+                    "content": "This custom chunk describes persistent worry and sleep problems.",
+                    "tags": ["custom", "worry"],
+                },
+                {
+                    "id": "custom-2",
+                    "title": "Custom Psychosis Chunk",
+                    "source": "dsm5",
+                    "content": "This custom chunk describes delusions and hallucinations.",
+                    "tags": ["custom", "psychosis"],
+                },
+            ]
+            with corpus_path.open("w", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record) + "\n")
+
+            knowledge_base = InMemoryKnowledgeBase(corpus_path=corpus_path)
+            results = knowledge_base.search("persistent worry sleep", limit=2)
+
+            self.assertEqual(results[0].id, "custom-1")
 
 
 if __name__ == "__main__":

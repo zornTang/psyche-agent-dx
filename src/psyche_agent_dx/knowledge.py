@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-import re
+import json
+import math
 from dataclasses import dataclass
+from pathlib import Path
+import re
+from typing import Iterable
 
 from psyche_agent_dx.schemas import EvidenceChunk, EvidenceSource
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z]{2,}|[\u4e00-\u9fff]{2,}")
+BM25_K1 = 1.5
+BM25_B = 0.75
+TITLE_WEIGHT = 1.3
+TAG_WEIGHT = 1.7
+CONTENT_WEIGHT = 1.0
 
 
 @dataclass(frozen=True)
@@ -18,25 +27,87 @@ class KnowledgeDocument:
     tags: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _IndexedDocument:
+    document: KnowledgeDocument
+    content_tokens: list[str]
+    title_tokens: list[str]
+    tag_tokens: list[str]
+    content_term_freqs: dict[str, int]
+    title_term_freqs: dict[str, int]
+    tag_term_freqs: dict[str, int]
+
+
 class InMemoryKnowledgeBase:
-    def __init__(self, documents: list[KnowledgeDocument] | None = None) -> None:
-        self._documents = documents or default_documents()
+    """Local knowledge base backed by a persistent JSONL corpus and BM25 scoring."""
+
+    def __init__(
+        self,
+        documents: list[KnowledgeDocument] | None = None,
+        *,
+        corpus_path: str | Path | None = None,
+    ) -> None:
+        if documents is not None:
+            raw_documents = documents
+        else:
+            raw_documents = load_documents(corpus_path or default_corpus_path())
+
+        self._documents = raw_documents
+        self._indexed_documents = [_index_document(document) for document in raw_documents]
+        self._content_doc_freqs = _document_frequencies(
+            item.content_term_freqs.keys() for item in self._indexed_documents
+        )
+        self._title_doc_freqs = _document_frequencies(
+            item.title_term_freqs.keys() for item in self._indexed_documents
+        )
+        self._tag_doc_freqs = _document_frequencies(
+            item.tag_term_freqs.keys() for item in self._indexed_documents
+        )
+        self._avg_content_length = _average_length(
+            len(item.content_tokens) for item in self._indexed_documents
+        )
+        self._avg_title_length = _average_length(len(item.title_tokens) for item in self._indexed_documents)
+        self._avg_tag_length = _average_length(len(item.tag_tokens) for item in self._indexed_documents)
 
     def search(self, query: str, limit: int = 4) -> list[EvidenceChunk]:
-        query_tokens = set(_tokenize(query))
+        query_tokens = _tokenize(query)
+        if not query_tokens:
+            return []
+
         scored: list[tuple[float, KnowledgeDocument]] = []
+        total_docs = len(self._indexed_documents)
 
-        for document in self._documents:
-            content_tokens = set(_tokenize(document.content))
-            title_tokens = set(_tokenize(document.title))
-            tag_tokens = {tag.lower() for tag in document.tags}
-            overlap = len(query_tokens & content_tokens)
-            overlap += len(query_tokens & title_tokens) * 1.5
-            overlap += len(query_tokens & tag_tokens) * 2
+        for indexed in self._indexed_documents:
+            score = 0.0
+            score += CONTENT_WEIGHT * _bm25_score(
+                query_tokens,
+                indexed.content_term_freqs,
+                self._content_doc_freqs,
+                len(indexed.content_tokens),
+                self._avg_content_length,
+                total_docs,
+            )
+            score += TITLE_WEIGHT * _bm25_score(
+                query_tokens,
+                indexed.title_term_freqs,
+                self._title_doc_freqs,
+                len(indexed.title_tokens),
+                self._avg_title_length,
+                total_docs,
+            )
+            score += TAG_WEIGHT * _bm25_score(
+                query_tokens,
+                indexed.tag_term_freqs,
+                self._tag_doc_freqs,
+                len(indexed.tag_tokens),
+                self._avg_tag_length,
+                total_docs,
+            )
+            score += _tag_overlap_bonus(query_tokens, indexed.document.tags)
 
-            if overlap <= 0:
+            if score <= 0:
                 continue
-            scored.append((overlap, document))
+            scored.append((score, indexed.document))
 
         scored.sort(key=lambda item: item[0], reverse=True)
         return [
@@ -46,10 +117,110 @@ class InMemoryKnowledgeBase:
                 source=document.source,
                 content=document.content,
                 tags=list(document.tags),
-                score=score,
+                score=round(score, 4),
             )
             for score, document in scored[:limit]
         ]
+
+
+def default_corpus_path() -> Path:
+    return project_root() / "data" / "knowledge" / "default_corpus.jsonl"
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def load_documents(corpus_path: str | Path) -> list[KnowledgeDocument]:
+    path = Path(corpus_path)
+    documents: list[KnowledgeDocument] = []
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            try:
+                documents.append(
+                    KnowledgeDocument(
+                        id=str(payload["id"]),
+                        title=str(payload["title"]),
+                        source=EvidenceSource(str(payload["source"])),
+                        content=str(payload["content"]),
+                        tags=tuple(str(tag) for tag in payload.get("tags", [])),
+                    )
+                )
+            except KeyError as exc:
+                raise ValueError(f"Invalid corpus record at {path}:{line_number}: missing {exc.args[0]}") from exc
+
+    return documents
+
+
+def _index_document(document: KnowledgeDocument) -> _IndexedDocument:
+    content_tokens = _tokenize(document.content)
+    title_tokens = _tokenize(document.title)
+    tag_tokens = [token for tag in document.tags for token in _tokenize(tag)]
+    return _IndexedDocument(
+        document=document,
+        content_tokens=content_tokens,
+        title_tokens=title_tokens,
+        tag_tokens=tag_tokens,
+        content_term_freqs=_term_frequencies(content_tokens),
+        title_term_freqs=_term_frequencies(title_tokens),
+        tag_term_freqs=_term_frequencies(tag_tokens),
+    )
+
+
+def _document_frequencies(term_sets: Iterable[Iterable[str]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for terms in term_sets:
+        for term in set(terms):
+            counts[term] = counts.get(term, 0) + 1
+    return counts
+
+
+def _average_length(lengths: Iterable[int]) -> float:
+    values = list(lengths)
+    if not values:
+        return 1.0
+    return max(sum(values) / len(values), 1.0)
+
+
+def _term_frequencies(tokens: Iterable[str]) -> dict[str, int]:
+    freqs: dict[str, int] = {}
+    for token in tokens:
+        freqs[token] = freqs.get(token, 0) + 1
+    return freqs
+
+
+def _bm25_score(
+    query_tokens: Iterable[str],
+    term_freqs: dict[str, int],
+    doc_freqs: dict[str, int],
+    doc_length: int,
+    avg_doc_length: float,
+    total_docs: int,
+) -> float:
+    score = 0.0
+    normalized_length = 1 - BM25_B + BM25_B * (doc_length / max(avg_doc_length, 1.0))
+
+    for token in query_tokens:
+        frequency = term_freqs.get(token, 0)
+        if frequency <= 0:
+            continue
+        doc_frequency = doc_freqs.get(token, 0)
+        inverse_doc_frequency = math.log(1 + ((total_docs - doc_frequency + 0.5) / (doc_frequency + 0.5)))
+        numerator = frequency * (BM25_K1 + 1)
+        denominator = frequency + BM25_K1 * normalized_length
+        score += inverse_doc_frequency * (numerator / denominator)
+
+    return score
+
+
+def _tag_overlap_bonus(query_tokens: Iterable[str], tags: tuple[str, ...]) -> float:
+    lowered_tags = {tag.lower() for tag in tags}
+    return sum(0.25 for token in query_tokens if token in lowered_tags)
 
 
 def _tokenize(text: str) -> list[str]:
@@ -71,312 +242,3 @@ def _cjk_ngrams(token: str, size: int) -> list[str]:
     if len(token) <= size:
         return []
     return [token[index : index + size] for index in range(len(token) - size + 1)]
-
-
-def default_documents() -> list[KnowledgeDocument]:
-    return [
-        *_curated_dsm5_documents(),
-        KnowledgeDocument(
-            id="dsm5-mdd",
-            title="DSM-5 Major Depressive Episode",
-            source=EvidenceSource.DSM5,
-            content=(
-                "Persistent low mood, diminished interest, sleep disturbance, fatigue, "
-                "guilt, concentration problems, and functional impairment support a "
-                "major depressive episode differential."
-            ),
-            tags=("depression", "mood", "sleep", "fatigue"),
-        ),
-        KnowledgeDocument(
-            id="dsm5-gad",
-            title="DSM-5 Generalized Anxiety Features",
-            source=EvidenceSource.DSM5,
-            content=(
-                "Excessive worry across domains, restlessness, muscle tension, sleep "
-                "disturbance, irritability, and difficulty controlling anxiety suggest "
-                "generalized anxiety disorder."
-            ),
-            tags=("anxiety", "worry", "restlessness", "sleep"),
-        ),
-        KnowledgeDocument(
-            id="dsm5-adjustment",
-            title="DSM-5 Adjustment Disorder Pattern",
-            source=EvidenceSource.DSM5,
-            content=(
-                "Symptoms emerging after an identifiable stressor with distress out of "
-                "proportion to the event and impaired functioning may fit adjustment disorder."
-            ),
-            tags=("stressor", "adjustment", "distress", "function"),
-        ),
-        KnowledgeDocument(
-            id="cbt-cognitive-restructuring",
-            title="CBT Cognitive Restructuring",
-            source=EvidenceSource.CBT,
-            content=(
-                "Identify automatic thoughts, examine evidence, challenge cognitive "
-                "distortions, and replace them with balanced alternatives."
-            ),
-            tags=("cbt", "thoughts", "reframing", "distortions"),
-        ),
-        KnowledgeDocument(
-            id="cbt-behavioral-activation",
-            title="CBT Behavioral Activation",
-            source=EvidenceSource.CBT,
-            content=(
-                "Low motivation and withdrawal can be addressed through activity scheduling, "
-                "small achievable goals, and reinforcement of adaptive routines."
-            ),
-            tags=("cbt", "depression", "withdrawal", "motivation"),
-        ),
-        KnowledgeDocument(
-            id="safety-crisis",
-            title="Safety Escalation Guidance",
-            source=EvidenceSource.SAFETY,
-            content=(
-                "Active suicidal intent, a specific plan, command hallucinations, or "
-                "imminent danger require immediate crisis escalation and human review."
-            ),
-            tags=("suicide", "self-harm", "crisis", "escalation"),
-        ),
-    ]
-
-
-def _curated_dsm5_documents() -> list[KnowledgeDocument]:
-    return [
-        KnowledgeDocument(
-            id="dsm5-zh-mdd",
-            title="DSM-5 重性抑郁障碍诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。重性抑郁障碍强调在同一两周内出现至少五项症状，"
-                "其中至少一项为抑郁心境或兴趣与愉悦明显下降。常见表现包括睡眠改变、食欲或体重改变、"
-                "疲劳、精神运动性激越或迟滞、无价值感或过度内疚、注意力下降，以及反复死亡或自杀观念。"
-                "这些症状需要造成显著痛苦或功能损害，并且不能更好地由物质、躯体疾病或躁狂/轻躁狂病程解释。"
-            ),
-            tags=(
-                "抑郁",
-                "重性抑郁",
-                "低落",
-                "兴趣减退",
-                "失眠",
-                "疲劳",
-                "自杀观念",
-                "depression",
-                "mdd",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-panic",
-            title="DSM-5 惊恐障碍诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。惊恐障碍要求反复出现不可预期的惊恐发作，发作在数分钟内达到高峰，"
-                "并伴随心悸、出汗、发抖、气短、胸部不适、头晕、麻木、现实解体、害怕失控或濒死感等症状中的多项。"
-                "至少一次发作后，还需持续一个月以上出现对再次发作或其后果的担忧，或出现显著的回避和行为改变。"
-                "如果惊恐仅由特定情境、物质或躯体疾病诱发，则应优先考虑其他诊断。"
-            ),
-            tags=(
-                "惊恐",
-                "惊恐发作",
-                "心悸",
-                "濒死感",
-                "回避",
-                "panic",
-                "panic attack",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-gad",
-            title="DSM-5 广泛性焦虑障碍诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。广泛性焦虑障碍要求在至少六个月的大多数日子里，"
-                "针对多个事件或活动出现过度且难以控制的担忧。成年人通常还会伴随至少三项症状，"
-                "包括坐立不安、容易疲劳、注意力难集中、易激惹、肌肉紧张和睡眠障碍。"
-                "症状需引起明显痛苦或功能损害，并排除物质、躯体疾病以及其他更能解释担忧内容的精神障碍。"
-            ),
-            tags=(
-                "焦虑",
-                "广泛性焦虑",
-                "担忧",
-                "紧张",
-                "肌肉紧张",
-                "睡眠障碍",
-                "anxiety",
-                "gad",
-                "worry",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-ptsd",
-            title="DSM-5 创伤后应激障碍诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。创伤后应激障碍首先要求接触真实或受威胁的死亡、严重伤害或性暴力。"
-                "随后症状通常分布在四个簇：侵入性再体验，持续回避，与创伤相关的负性认知和心境改变，"
-                "以及警觉性和反应性升高，例如惊跳增强、易激惹、睡眠问题和注意困难。"
-                "相关症状持续超过一个月并造成明显功能损害时，才支持PTSD诊断。"
-            ),
-            tags=(
-                "创伤",
-                "创伤后应激",
-                "闪回",
-                "回避",
-                "惊跳",
-                "过度警觉",
-                "ptsd",
-                "trauma",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-adjustment",
-            title="DSM-5 适应障碍诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。适应障碍强调在明确应激源出现后三个月内，出现情绪或行为上的适应不良反应。"
-                "表现可以偏向抑郁、焦虑，或情绪与行为混合，但其共同点是痛苦程度与应激源不成比例，"
-                "或者已经造成社交、职业等功能受损。该诊断不适用于已满足其他精神障碍完整标准的情形，"
-                "并且在应激源或其后果结束后，症状通常不应持续超过六个月。"
-            ),
-            tags=(
-                "适应障碍",
-                "应激",
-                "压力事件",
-                "功能受损",
-                "adjustment",
-                "stressor",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-ocd",
-            title="DSM-5 强迫症诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。强迫症的核心是强迫思维、强迫行为，或二者兼有。"
-                "强迫思维表现为反复侵入、难以摆脱且令人痛苦的念头、冲动或意象；强迫行为则是为了减轻焦虑而重复进行的行为或心理活动。"
-                "这些症状通常耗时、显著影响功能，并且不同于对现实问题的普通担忧。"
-            ),
-            tags=(
-                "强迫",
-                "强迫症",
-                "侵入性想法",
-                "重复行为",
-                "ocd",
-                "obsession",
-                "compulsion",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-social-anxiety",
-            title="DSM-5 社交焦虑障碍诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。社交焦虑障碍的核心是对可能被他人审视的社交或表演情境产生显著害怕或焦虑，"
-                "并担心自己的言行或焦虑表现会招致负面评价、羞辱或拒绝。相关社交情境几乎总会触发焦虑，"
-                "个体常主动回避，或带着强烈不适去忍受，且这种模式通常持续至少六个月并影响学习、工作或人际功能。"
-            ),
-            tags=(
-                "社交焦虑",
-                "社交恐惧",
-                "负面评价",
-                "羞辱",
-                "回避社交",
-                "social anxiety",
-                "social phobia",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-agoraphobia",
-            title="DSM-5 广场恐怖症诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。广场恐怖症要求对至少两类情境产生显著害怕或焦虑，"
-                "例如公共交通、开放空间、密闭空间、排队拥挤环境或独自离家。核心担心是当出现惊恐样症状或其他失能、尴尬症状时，"
-                "难以逃离或得不到帮助，因此个体会回避相关场景、需要陪伴，或只能强忍焦虑暴露。"
-            ),
-            tags=(
-                "广场恐怖",
-                "公共交通",
-                "拥挤环境",
-                "独自离家",
-                "逃离困难",
-                "agoraphobia",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-bipolar1",
-            title="DSM-5 双相I型障碍躁狂发作要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。躁狂发作强调至少一周持续存在明显异常且持续的心境高涨、膨胀或易激惹，"
-                "并伴随活动增多或精力旺盛。常见伴随表现包括自尊膨胀、睡眠需求减少、话多、思维奔逸、注意分散、"
-                "目标导向活动增加和高风险行为。若症状导致显著功能受损、需要住院，或伴有精神病性特征，应高度考虑躁狂发作和双相I型障碍。"
-            ),
-            tags=(
-                "双相",
-                "躁狂",
-                "睡眠需求减少",
-                "思维奔逸",
-                "高风险行为",
-                "bipolar",
-                "mania",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-schizophrenia",
-            title="DSM-5 精神分裂症诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。精神分裂症强调在活动期出现至少两项核心症状，"
-                "其中至少一项必须是妄想、幻觉或言语紊乱，其他常见表现包括明显紊乱或紧张症行为，以及阴性症状。"
-                "同时需要存在工作、人际或自我照料方面的明显功能下降，并且整体病程体征持续至少六个月。"
-            ),
-            tags=(
-                "精神分裂症",
-                "妄想",
-                "幻觉",
-                "言语紊乱",
-                "阴性症状",
-                "schizophrenia",
-                "psychosis",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-somatic-symptom",
-            title="DSM-5 躯体症状障碍诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。躯体症状障碍的核心不在于症状是否医学无法解释，"
-                "而在于一个或多个躯体症状带来真实痛苦或生活受损，并伴随对症状严重性的持续过度想法、"
-                "高水平健康焦虑，或在症状和健康担忧上投入过多时间与精力。症状状态通常持续超过六个月。"
-            ),
-            tags=(
-                "躯体症状",
-                "躯体化",
-                "疼痛",
-                "健康焦虑",
-                "反复就医",
-                "somatic",
-                "somatic symptom disorder",
-            ),
-        ),
-        KnowledgeDocument(
-            id="dsm5-zh-illness-anxiety",
-            title="DSM-5 疾病焦虑障碍诊断要点",
-            source=EvidenceSource.DSM5,
-            content=(
-                "基于中文版DSM-5 OCR整理。疾病焦虑障碍是对罹患或将患严重疾病的持续先占观念，"
-                "即使没有躯体症状或症状很轻，也会有明显的健康焦虑。个体常反复自我检查、寻求确认，"
-                "或相反回避医院与检查；这种疾病担忧通常持续至少六个月，并不能被其他精神障碍更好地解释。"
-            ),
-            tags=(
-                "疾病焦虑",
-                "疑病",
-                "健康焦虑",
-                "反复检查",
-                "寻求确认",
-                "illness anxiety",
-                "hypochondriasis",
-            ),
-        ),
-    ]
