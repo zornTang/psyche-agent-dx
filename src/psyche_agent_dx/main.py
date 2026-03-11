@@ -1,10 +1,13 @@
-from datetime import datetime
+import uvicorn
 
 
 def main() -> None:
-    print("Psyche Agent Dx")
-    print("Multi-agent mental health diagnosis support system")
-    print(f"Initialized at: {datetime.now().isoformat(timespec='seconds')}")
+    uvicorn.run(
+        "psyche_agent_dx.api:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=False,
+    )
 
 
 if __name__ == "__main__":
